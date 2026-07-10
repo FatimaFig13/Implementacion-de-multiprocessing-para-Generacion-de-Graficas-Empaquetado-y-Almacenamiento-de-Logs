@@ -94,4 +94,4 @@ python3 -m pytest test_productor_paquetes.py -v
 Deben pasar 8 pruebas (`PASSED`), incluyendo una que confirma que dos
 tareas distintas corren en PIDs distintos, y otra que confirma que si una
 tarea falla, las demás se completan y el `Pool` se cierra correctamente.
----
+
