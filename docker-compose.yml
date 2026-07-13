@@ -1,0 +1,22 @@
+services:
+  mongo_stori:
+    image: mongo:7.0
+    container_name: mongo_stori
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-stori_admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-changeme_dev}
+      MONGO_INITDB_DATABASE: stori_logs
+    volumes:
+      - mongo_stori_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  mongo_stori_data:
