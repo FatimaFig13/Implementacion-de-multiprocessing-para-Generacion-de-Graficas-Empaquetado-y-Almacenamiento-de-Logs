@@ -6,9 +6,15 @@ import os
 import shutil
 import time
 import traceback
+import uuid
+from datetime import datetime, timezone
 import pandas as pd
 from dataclasses import dataclass, field
 from typing import Optional
+
+# Timeout corto para las conexiones "best-effort" de logging: si Mongo no
+# esta disponible, no queremos que cada worker se quede colgado esperando.
+_TIMEOUT_LOGGING_MS = 800
 
 
 @dataclass
@@ -18,7 +24,7 @@ class TareaGrafica:
     directorio_salida: str = "paquetes"
     formato_imagen: str = "png"
 
-def _generar_producto_worker(tarea: TareaGrafica) -> dict:
+def _generar_producto_worker_interno(tarea: TareaGrafica) -> dict:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -88,6 +94,7 @@ def _generar_producto_worker(tarea: TareaGrafica) -> dict:
             "estadisticos": ruta_estadisticos,
             "metadatos": ruta_metadatos,
         }
+        resultado["metadatos"] = metadatos_out
 
     except Exception as e:
         resultado["error"] = f"{type(e).__name__}: {e}"
@@ -100,6 +107,86 @@ def _generar_producto_worker(tarea: TareaGrafica) -> dict:
         plt.close("all")
         resultado["duracion_seg"] = round(time.time() - inicio, 3)
  
+    return resultado
+
+
+
+_conexion_mongo_worker = None
+_registrador_worker = None
+
+
+def _obtener_registrador_worker():
+   
+    global _conexion_mongo_worker, _registrador_worker
+
+    if _registrador_worker is not None:
+        return _registrador_worker
+
+    try:
+        from conexion_mongo import ConexionMongo, RegistradorEventos
+
+        con = ConexionMongo(timeout_ms=_TIMEOUT_LOGGING_MS)
+        if not con.verificar_conexion():
+            print("[auditoria] Mongo no disponible, se omite el logging de este proceso.")
+            return None
+
+        _conexion_mongo_worker = con
+        _registrador_worker = RegistradorEventos(con)
+        return _registrador_worker
+    except Exception as e:
+        print(f"[auditoria] No se pudo inicializar la conexion a MongoDB: {e}")
+        return None
+
+
+def _extraer_tipo_excepcion(mensaje_error: Optional[str]) -> Optional[str]:
+    if not mensaje_error or ":" not in mensaje_error:
+        return None
+    posible_tipo = mensaje_error.split(":", 1)[0].strip()
+    return posible_tipo if posible_tipo.isidentifier() else None
+
+
+def _registrar_resultado_en_mongo(tarea: TareaGrafica, resultado: dict) -> None:
+    registrador = _obtener_registrador_worker()
+    if registrador is None:
+        return
+
+    origen = {
+        "modulo": "GeneradorParalelo",
+        "proceso_id": str(resultado.get("pid", os.getpid())),
+        "proyecto": "STORI",
+    }
+    duracion_ms = (resultado.get("duracion_seg") or 0.0) * 1000
+
+    try:
+        if resultado.get("ok"):
+            metadatos = resultado.get("metadatos") or {}
+            registrador.registrar_generacion_exitosa(
+                origen=origen,
+                nombre_tarea=tarea.nombre,
+                tipo_grafico=metadatos.get("tipo_grafico"),
+                n_filas=metadatos.get("n_filas"),
+                columnas=metadatos.get("columnas", []),
+                archivos=resultado.get("archivos", {}),
+                duracion_ms=duracion_ms,
+            )
+        else:
+            mensaje_error = resultado.get("error") or "Error desconocido"
+            registrador.registrar_error(
+                origen=origen,
+                nombre_tarea=tarea.nombre,
+                tipo_excepcion=_extraer_tipo_excepcion(mensaje_error),
+                mensaje_error=mensaje_error,
+                duracion_ms=duracion_ms,
+            )
+    except Exception as e:
+        # El logging jamas debe tumbar la generacion de graficas.
+        print(f"[auditoria] No se pudo registrar el evento en MongoDB: {e}")
+
+
+def _generar_producto_worker(tarea: TareaGrafica) -> dict:
+    
+    resultado = _generar_producto_worker_interno(tarea)
+    _registrar_resultado_en_mongo(tarea, resultado)
     return resultado
 
 
@@ -146,13 +233,41 @@ class GeneradorParalelo:
         ctx = mp.get_context("spawn")
         pool = ctx.Pool(processes=n_procesos)
 
+        inicio = datetime.now(timezone.utc)
         try:
             resultados = pool.map(_generar_producto_worker, tareas)
         finally:
             pool.close()
             pool.join()
+        fin = datetime.now(timezone.utc)
 
+        self._registrar_resumen_ejecucion(tareas, resultados, n_procesos, inicio, fin)
         return resultados
+
+    def _registrar_resumen_ejecucion(self, tareas, resultados, n_procesos, inicio, fin) -> None:
+        try:
+            from conexion_mongo import ConexionMongo, RegistradorEventos
+
+            con = ConexionMongo(timeout_ms=_TIMEOUT_LOGGING_MS)
+            if not con.verificar_conexion():
+                print("[auditoria] Mongo no disponible, se omite el resumen de la ejecucion.")
+                return
+
+            registrador = RegistradorEventos(con)
+            exitosas = sum(1 for r in resultados if r.get("ok"))
+            registrador.registrar_resumen_ejecucion(
+                run_id=str(uuid.uuid4()),
+                timestamp_inicio=inicio,
+                timestamp_fin=fin,
+                n_procesos=n_procesos,
+                total_tareas=len(tareas),
+                exitosas=exitosas,
+                fallidas=len(tareas) - exitosas,
+                duracion_total_seg=(fin - inicio).total_seconds(),
+            )
+            con.cerrar()
+        except Exception as e:
+            print(f"[auditoria] No se pudo registrar el resumen de la ejecucion: {e}")
     
 def empaquetar_zip(directorio_paquete: str, ruta_zip: Optional[str] = None)->str:
     
