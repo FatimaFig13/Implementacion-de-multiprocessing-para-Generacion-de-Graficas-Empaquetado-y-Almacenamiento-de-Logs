@@ -9,14 +9,41 @@ services:
       MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-stori_admin}
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-changeme_dev}
       MONGO_INITDB_DATABASE: stori_logs
+      # Usadas por mongo-init/init-app-user.sh para crear el usuario de la app
+      MONGO_APP_USERNAME: ${MONGO_APP_USERNAME:-stori_app}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:-changeme_app}
     volumes:
       - mongo_stori_data:/data/db
+      # Se ejecuta automaticamente solo cuando el volumen esta vacio (primer arranque)
+      - ./mongo-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
+    networks:
+      - red_stori
+
+  stori_app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stori_app
+    restart: "no"
+    depends_on:
+      mongo_stori:
+        condition: service_healthy
+    environment:
+      MONGO_URI: ${MONGO_URI:-mongodb://${MONGO_APP_USERNAME:-stori_app}:${MONGO_APP_PASSWORD:-changeme_app}@mongo_stori:27017/stori_logs?authSource=stori_logs}
+    volumes:
+      - ./paquetes:/app/paquetes
+    networks:
+      - red_stori
+
+networks:
+  red_stori:
+    driver: bridge
 
 volumes:
-  mongo_stori_data:
+  mongo_stori_data:  
